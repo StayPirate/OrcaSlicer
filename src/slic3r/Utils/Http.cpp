@@ -86,13 +86,6 @@ std::unique_ptr<CurlGlobalInit> CurlGlobalInit::instance;
 std::map<std::string, std::string> extra_headers;
 std::mutex g_mutex;
 
-struct form_file
-{
-    fs::ifstream ifs;
-    boost::filesystem::ifstream::off_type init_offset;
-    size_t                                content_length;
-};
-
 struct Http::priv
 {
 	enum {
@@ -110,7 +103,7 @@ struct Http::priv
 	std::string buffer;
 	// Used for storing file streams added as multipart form parts
 	// Using a deque here because unlike vector it doesn't ivalidate pointers on insertion
-	std::deque<form_file> form_files;
+	std::deque<fs::ifstream> form_files;
 	std::string postfields;
 	std::string error_buffer;    // Used for CURLOPT_ERRORBUFFER
     std::string headers;
@@ -137,7 +130,7 @@ struct Http::priv
 
 	void set_timeout_connect(long timeout);
     void set_timeout_max(long timeout);
-	void form_add_file(const char *name, const fs::path &path, const char* filename, boost::filesystem::ifstream::off_type offset, size_t length);
+	void form_add_file(const char *name, const fs::path &path, const char* filename);
 	/* mime */
 	void mime_form_add_text(const char* name, const char* value);
 	void mime_form_add_file(const char* name, const char* path);
@@ -261,27 +254,15 @@ int Http::priv::xfercb_legacy(void *userp, double dltotal, double dlnow, double 
 
 size_t Http::priv::form_file_read_cb(char *buffer, size_t size, size_t nitems, void *userp)
 {
-    auto f = reinterpret_cast<form_file*>(userp);
+	auto stream = reinterpret_cast<fs::ifstream*>(userp);
 
 	try {
-	    size_t max_read_size = size * nitems;
-        if (f->content_length == 0) {
-			// Unlimited
-            f->ifs.read(buffer, max_read_size);
-        } else {
-            unsigned long long read_size = f->ifs.tellg() - f->init_offset;
-            if (read_size >= f->content_length) {
-                return 0;
-            }
-
-            max_read_size = std::min(max_read_size, size_t(f->content_length - read_size));
-            f->ifs.read(buffer, max_read_size);
-        }
+		stream->read(buffer, size * nitems);
 	} catch (const std::exception &) {
 		return CURL_READFUNC_ABORT;
 	}
 
-	return f->ifs.gcount();
+	return stream->gcount();
 }
 
 size_t Http::priv::headers_cb(char *buffer, size_t size, size_t nitems, void *userp)
@@ -305,7 +286,7 @@ void Http::priv::set_timeout_max(long timeout)
     ::curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
 }
 
-void Http::priv::form_add_file(const char *name, const fs::path &path, const char* filename, boost::filesystem::ifstream::off_type offset, size_t length)
+void Http::priv::form_add_file(const char *name, const fs::path &path, const char* filename)
 {
 	// We can't use CURLFORM_FILECONTENT, because curl doesn't support Unicode filenames on Windows
 	// and so we use CURLFORM_STREAM with boost ifstream to read the file.
@@ -314,21 +295,18 @@ void Http::priv::form_add_file(const char *name, const fs::path &path, const cha
 		filename = path.string().c_str();
 	}
 
-	form_files.emplace_back(form_file{{path, std::ios::in | std::ios::binary}, offset, length});
-	auto &f = form_files.back();
-    size_t size = length;
-    if (length == 0) {
-        f.ifs.seekg(0, std::ios::end);
-        size = f.ifs.tellg() - offset;
-    }
-    f.ifs.seekg(offset);
+	form_files.emplace_back(path, std::ios::in | std::ios::binary);
+	auto &stream = form_files.back();
+	stream.seekg(0, std::ios::end);
+	size_t size = stream.tellg();
+	stream.seekg(0);
 
 	if (filename != nullptr) {
 		::curl_formadd(&form, &form_end,
 			CURLFORM_COPYNAME, name,
 			CURLFORM_FILENAME, filename,
 			CURLFORM_CONTENTTYPE, "application/octet-stream",
-			CURLFORM_STREAM, static_cast<void*>(&f),
+			CURLFORM_STREAM, static_cast<void*>(&stream),
 			CURLFORM_CONTENTSLENGTH, static_cast<long>(size),
 			CURLFORM_END
 		);
@@ -609,9 +587,9 @@ Http& Http::form_add(const std::string &name, const std::string &contents)
 	return *this;
 }
 
-Http& Http::form_add_file(const std::string &name, const fs::path &path, boost::filesystem::ifstream::off_type offset, size_t length)
+Http& Http::form_add_file(const std::string &name, const fs::path &path)
 {
-	if (p) { p->form_add_file(name.c_str(), path.c_str(), nullptr, offset, length); }
+	if (p) { p->form_add_file(name.c_str(), path.c_str(), nullptr); }
 	return *this;
 }
 
@@ -629,15 +607,15 @@ Http& Http::mime_form_add_file(std::string &name, const char* path)
 }
 
 
-Http& Http::form_add_file(const std::wstring& name, const fs::path& path, boost::filesystem::ifstream::off_type offset, size_t length)
+Http& Http::form_add_file(const std::wstring& name, const fs::path& path)
 {
-	if (p) { p->form_add_file((char*)name.c_str(), path.c_str(), nullptr, offset, length); }
+	if (p) { p->form_add_file((char*)name.c_str(), path.c_str(), nullptr); }
 	return *this;
 }
 
-Http& Http::form_add_file(const std::string &name, const fs::path &path, const std::string &filename, boost::filesystem::ifstream::off_type offset, size_t length)
+Http& Http::form_add_file(const std::string &name, const fs::path &path, const std::string &filename)
 {
-	if (p) { p->form_add_file(name.c_str(), path.c_str(), filename.c_str(), offset, length); }
+	if (p) { p->form_add_file(name.c_str(), path.c_str(), filename.c_str()); }
 	return *this;
 }
 
